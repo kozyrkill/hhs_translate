@@ -1,0 +1,4 @@
+"Description" - безопасно
+"DisplayText"
+"DecisionText"
+"Str" - не безопасно, но нужно. Надо думать как.
