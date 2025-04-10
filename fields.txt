@@ -1,4 +1,12 @@
-"Description" - безопасно
+Description - безопасно
+SeqVar_String::Str?UserFacing=True
+
+
+
+
+
+DisplayText
+
 "DisplayText"
 "DecisionText"
 "Str" - не безопасно, но нужно. Надо думать как.
