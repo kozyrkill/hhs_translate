@@ -52,6 +52,7 @@ def load_cache():
 def save_cache_with_source(cache, source_map):
     enriched_cache = {}
     for k, v in cache.items():
+        # Если объект уже словарь, используем его "как есть", иначе упаковываем
         if isinstance(v, dict):
             enriched_cache[k] = v
         else:
@@ -71,12 +72,17 @@ def is_english(text):
 
 @lru_cache(maxsize=10000)
 def translate_bbcode_preserving_tags(text, translator):
+    """
+    Переводит содержимое между BB-кодами, не ломая сами [теги].
+    """
     parts = BB_RE.split(text)
     translated_parts = []
     for part in parts:
         if BB_RE.match(part):
+            # Это BB-тег, не трогаем
             translated_parts.append(part)
         else:
+            # Это обычный текст вне BB-тегов
             lines = part.split('\n')
             translated_lines = []
             for line in lines:
@@ -96,6 +102,12 @@ def translate_bbcode_preserving_tags(text, translator):
     return ''.join(translated_parts)
 
 def batch_translate(texts, translator, delay_seconds=1.5, max_chars_per_batch=3000, fields=None):
+    """
+    Переводит список строк texts батчами, при этом:
+      - использует локальный кэш,
+      - соблюдает задержку между батчами,
+      - записывает источник (field) в кэше в поле "source".
+    """
     cache = load_cache()
     source_map = {}
     results = []
@@ -105,9 +117,12 @@ def batch_translate(texts, translator, delay_seconds=1.5, max_chars_per_batch=30
     all_placeholders = []
 
     for idx, text in enumerate(texts):
+        # Проверяем кэш
         if isinstance(cache.get(text), dict):
+            # В кэше уже есть запись в виде словаря
             results.append(cache[text]["text"])
         elif text in cache:
+            # В кэше есть только строка
             results.append(cache[text])
         else:
             masked, placeholders = mask_placeholders(text)
@@ -115,24 +130,30 @@ def batch_translate(texts, translator, delay_seconds=1.5, max_chars_per_batch=30
             all_placeholders.append(placeholders)
             results.append(None)
             to_translate.append(text)
+
+            # Определяем "источник" для текущей строки:
             field = fields[idx] if fields and idx < len(fields) else "unknown"
             original_map.append((len(results) - 1, field))
 
+    # Если всё уже в кэше, возвращаем результат
     if not to_translate:
         print("⚡ Всё найдено в кэше.")
         return results
 
+    # Разбиваем на батчи
     batch = []
     batch_queue = []
     batch_len = 0
 
     for text in masked_texts:
+        # Если добавление текста превышает лимит, уходим в следующий батч
         if batch_len + len(text) > max_chars_per_batch and batch:
             batch_queue.append(batch)
             batch = []
             batch_len = 0
         batch.append(text)
         batch_len += len(text)
+
     if batch:
         batch_queue.append(batch)
 
@@ -146,7 +167,7 @@ def batch_translate(texts, translator, delay_seconds=1.5, max_chars_per_batch=30
     min_delay = 1.0
     translated_all = []
 
-    for i, batch in enumerate(batch_queue, 1):
+    for i, batch_part in enumerate(batch_queue, 1):
         print(f"➡️ Батч {i} из {total_batches}…")
         start_time = time.time()
         success = False
@@ -154,19 +175,28 @@ def batch_translate(texts, translator, delay_seconds=1.5, max_chars_per_batch=30
 
         while not success and retries < 5:
             try:
-                translated = translator.translate_batch(batch)
+                translated = translator.translate_batch(batch_part)
                 start_index = len(translated_all)
+
+                # Возвращаем плейсхолдеры
                 for j, translated_text in enumerate(translated):
                     placeholders = all_placeholders[start_index + j]
                     translated[j] = unmask_placeholders(translated_text, placeholders)
+
                 translated_all.extend(translated)
+
+                # Записываем в кэш
                 for j, (src, tgt) in enumerate(zip(to_translate[start_index:start_index+len(translated)], translated)):
-                    cache[src] = tgt
+                    # Берём поле из original_map (там поле хранится по индексу)
                     _, source_field = original_map[start_index + j]
+                    cache[src] = tgt
                     source_map[src] = source_field
+
                 save_cache_with_source(cache, source_map)
                 success = True
+                # При удачном переводе можно немного уменьшить задержку
                 dynamic_delay = max(min_delay, dynamic_delay * 0.9)
+
             except Exception as e:
                 print(f"[!] Ошибка при переводе батча {i}: {e}")
                 retries += 1
@@ -186,15 +216,26 @@ def batch_translate(texts, translator, delay_seconds=1.5, max_chars_per_batch=30
 
         time.sleep(dynamic_delay)
 
-    for idx, _ in original_map:
-        results[idx] = cache[texts[idx]] if isinstance(cache[texts[idx]], str) else cache[texts[idx]]["text"]
+    # Переносим переводы из кэша в results
+    for idx, text in enumerate(texts):
+        if results[idx] is None:
+            # Может быть dict или строка
+            if isinstance(cache[text], dict):
+                results[idx] = cache[text]["text"]
+            else:
+                results[idx] = cache[text]
 
     print("✅ Перевод завершён (с кэшированием).")
     return results
 
 def translate_fields(root_folder, fields, delay_seconds=1.5, max_chars_per_batch=3000, strict=False):
+    """
+    Ищет в указанной папке файлы .xml, вытаскивает из них тексты из нужных тегов,
+    переводит эти тексты (если они на английском) и перезаписывает xml.
+    """
     translator = GoogleTranslateWrapper()
     to_translate = []
+    sources_for_translate = []  # <-- тут храним названия тегов (источников)
     text_locations = []
     modified_files = {}
     error_log = []
@@ -210,24 +251,33 @@ def translate_fields(root_folder, fields, delay_seconds=1.5, max_chars_per_batch
             try:
                 tree = ET.parse(file_path, parser)
                 root = tree.getroot()
+                # Сохраняем дерево и флаг, что файл был изменён
                 modified_files[file_path] = (tree, False)
 
                 for elem in root.iter():
                     localname = ET.QName(elem).localname
                     if localname in fields:
+                        # Пример: для поля DecisionText ищем дочерние <string>
                         if localname.lower() == "decisiontext":
                             for child in elem.findall(".//string"):
                                 if child.text and is_english(child.text.strip()):
-                                    to_translate.append(child.text.strip())
+                                    text_value = child.text.strip()
+                                    to_translate.append(text_value)
+                                    sources_for_translate.append(localname)  # Запоминаем тег
                                     text_locations.append((file_path, child, 'plain', None))
-                        elif elem.text:
-                            text = elem.text.strip()
-                            if is_english(text):
-                                if '[' in text and ']' in text:
-                                    text_locations.append((file_path, elem, 'bbcode', None))
-                                else:
-                                    to_translate.append(text)
-                                    text_locations.append((file_path, elem, 'plain', None))
+                        else:
+                            # Если у элемента есть текст
+                            if elem.text:
+                                text_value = elem.text.strip()
+                                if is_english(text_value):
+                                    to_translate.append(text_value)
+                                    sources_for_translate.append(localname)  # Запоминаем тег
+
+                                    # Определяем, bbcode это или обычный текст
+                                    if '[' in text_value and ']' in text_value:
+                                        text_locations.append((file_path, elem, 'bbcode', None))
+                                    else:
+                                        text_locations.append((file_path, elem, 'plain', None))
 
             except Exception as e:
                 msg = f'[!] Ошибка чтения {file_path}: {e}'
@@ -238,17 +288,26 @@ def translate_fields(root_folder, fields, delay_seconds=1.5, max_chars_per_batch
     if not to_translate:
         print("🎉 Всё уже переведено.")
     else:
-        translated_texts = batch_translate(to_translate, translator, delay_seconds, max_chars_per_batch)
+        # Передаём sources_for_translate как fields в batch_translate
+        translated_texts = batch_translate(
+            to_translate,
+            translator,
+            delay_seconds=delay_seconds,
+            max_chars_per_batch=max_chars_per_batch,
+            fields=sources_for_translate
+        )
 
-        ti = 0
+        # Возвращаем переводы на места
         for (file_path, elem, mode, _), translated in zip(text_locations, translated_texts):
             if mode == 'bbcode':
+                # Если это BB-код, отдельно используем функцию для сохранения тегов
                 elem.text = translate_bbcode_preserving_tags(elem.text, translator)
                 modified_files[file_path] = (modified_files[file_path][0], True)
             elif mode == 'plain':
                 elem.text = translated
                 modified_files[file_path] = (modified_files[file_path][0], True)
 
+        # Сохраняем изменения в файлах
         for file_path, (tree, was_modified) in modified_files.items():
             if was_modified:
                 try:
